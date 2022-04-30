@@ -16,6 +16,8 @@
 #include <avr/interrupt.h>
 #include <util/delay.h>
 #include <avr/pgmspace.h>
+#include <util/atomic.h>
+#include <avr/power.h>
 
 #include "IR_Receiver.h"
 
@@ -27,6 +29,12 @@ void usart_transmit(char arr[]);
 void removeGarbage();
 void ir_actions(int commandCode);
 void servo_init();
+void servo_auto();
+
+//state initialization
+int state = 0; //0 = manual, 1 = auto
+struct IR_Packet received_packet;
+
 
 int main(void)
 {
@@ -36,36 +44,33 @@ int main(void)
 	DDRB |= 1 << PINB1; // Set pin 9 on arduino to output
 	DDRD |= 0 << PIND4;
 	PORTD |= 1 << PIND4;
+	DDRB |= 0B000001; // PORTB5, LED
 	
 	//usart, receiver initialization
 	usart_init();
 	sei();
 	init_receiver();
-
+	servo_init();
 	
 	usart_transmit("START\n");
 	while (1) {
-		struct IR_Packet received_packet;
 		cli();
 		uint8_t check_result = check_new_packet(&received_packet);	
 		sei();
+		
+		if (state == 1)
+		{
+			servo_auto();
+		}
 
 		if (check_result)
 		{
-			char buff[10];
-			if (received_packet.repeat > 0)
-			{
-				//utoa(received_packet.repeat, buff, 10);
-				//usart_transmit(" Repeat: "); // Command repeat counter
-				//usart_transmit(buff);
-				ir_actions(currentCommand);
-			} else
-			{
-				usart_transmit("\n\r");
-				utoa(received_packet.command, buff, 16);
-				currentCommand = received_packet.command;
-				ir_actions(currentCommand);
-			}
+			//char buff[10];
+			usart_transmit("\n\r");
+			//utoa(received_packet.command, buff, 16);
+			//usart_transmit(buff);
+			currentCommand = received_packet.command;
+			ir_actions(currentCommand);
 		}
 	}
 	return 0;
@@ -102,6 +107,46 @@ void removeGarbage(){
 	}
 }
 
+void servo_init(){
+	DDRD |= _BV(5); // pin 5 out
+	
+	TCCR0A = _BV(WGM00) | _BV(COM0B1) | _BV(COM0B0) ; // mode5 , set on rising clear on falling
+	
+	TCCR0B = _BV(WGM02) | _BV(CS02) | _BV(CS00); //1024 prescaler
+	
+	OCR0A = 156; // 156*2=312=20ms period
+	OCR0B = 136;
+}
+
+void servo_auto(){
+	while(1){
+		for (OCR0B = 136; OCR0B < 152; OCR0B++){//1ms to 2ms duty
+			_delay_ms(100);
+			uint8_t check_result = check_new_packet(&received_packet);
+			//check for incoming signal, if signal is "MODE" button then stop
+			if (check_result && received_packet.command == 0x46 && received_packet.repeat == 0)
+			{
+				usart_transmit("new");
+				state = 0;
+				return;
+			}
+		}
+			
+		for (OCR0B = 152; OCR0B > 136; OCR0B--){//2ms to 1ms duty
+			_delay_ms(100);
+			uint8_t check_result = check_new_packet(&received_packet);
+			//check for incoming signal, if signal is "MODE" button then stop
+			if (check_result && received_packet.command == 0x46 && received_packet.repeat == 0)
+			{
+				usart_transmit("new");
+				state = 0;
+				return;
+			}
+		}
+	}
+		
+}
+
 void ir_actions(int commandCode){
 	switch (commandCode)
 		{
@@ -110,32 +155,49 @@ void ir_actions(int commandCode){
 			break;
 			case 0x46:
 			usart_transmit("SWITCH MODE");
+			if (received_packet.repeat == 0)
+			{
+				if (state == 0)
+				{
+					state = 1;
+				}else{
+					state = 0;
+				}
+				
+			}
 			break;
 			case 0x47:
 			usart_transmit("SHOOT");
+			// turn LED on
+			PORTB |= 0B000001; // PORTB5
+			_delay_ms(100);
+
+			// turn LED off
+			PORTB &= ~ 0B000001; // PORTB5
+			_delay_ms(100);
 			break;
 			case 0x40:
-			servo_init();
-			OCR1A = 1999 - 800;
 			usart_transmit("LEFT");
-			_delay_ms(1000);
+			if (OCR0B > 136)
+			{
+				OCR0B = OCR0B -1;
+			}
 			break;
 			case 0x43:
-			servo_init();
 			usart_transmit("RIGHT");
-			OCR1A = 3999 + 800;
-			_delay_ms(1000);
+			if (OCR0B < 152)
+			{
+				OCR0B = OCR0B +1;
+			}
+			break;
+			case 0x09:
+			usart_transmit("reset right");
+			OCR0B = 152;
+			break;
+			case 0x15:
+			usart_transmit("reset left");
+			OCR0B = 136;
 			break;
 		}
 }
 
-void servo_init(){
-	/* 1. Set Fast PWM mode 14: set WGM11, WGM12, WGM13 to 1 */
-	/* 3. Set pre-scalar of 8 */
-	/* 4. Set Fast PWM non-inverting mode */
-	TCCR1A |= (1 << WGM11) | (1 << COM1A1);
-	TCCR1B |= (1 << WGM12) | (1 << WGM13) | (1 << CS11);
-
-	/* 2. Set ICR1 register: PWM period */
-	ICR1 = 39999;
-}
